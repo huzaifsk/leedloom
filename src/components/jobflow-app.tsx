@@ -8,6 +8,7 @@ import {
   CheckCircle2Icon,
   CircleHelpIcon,
   ExternalLinkIcon,
+  FileTextIcon,
   FileSpreadsheetIcon,
   InboxIcon,
   LayoutDashboardIcon,
@@ -15,6 +16,7 @@ import {
   MailIcon,
   MessageCircleIcon,
   MoreHorizontalIcon,
+  PaperclipIcon,
   PlusIcon,
   SearchIcon,
   SendIcon,
@@ -22,6 +24,7 @@ import {
   SparklesIcon,
   UploadIcon,
   UsersIcon,
+  XIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -77,11 +80,13 @@ import {
   demoLeads,
   isValidContact,
   renderTemplate,
+  safeSourceUrl,
   type Lead,
   type MessageTemplate,
 } from "@/lib/jobflow"
 import { leadImportAccept, parseLeadFile } from "@/lib/import-leads"
 import { emptyWhatsAppProfile, isValidWhatsAppSender, normalizedWhatsAppRecipient, type GmailConnection, type WhatsAppProfile } from "@/lib/integrations"
+import { formatAttachmentSize, MESSAGE_ATTACHMENT_ACCEPT, validateMessageAttachments } from "@/lib/message-attachments"
 import { loadLeads, loadSenderName, loadTemplates, loadWhatsAppProfile, saveLeads, saveSenderName, saveTemplates, saveWhatsAppProfile } from "@/lib/storage"
 import { cn } from "@/lib/utils"
 
@@ -116,6 +121,11 @@ function contactLabel(lead: Lead) {
   return lead.value || "Untitled lead"
 }
 
+function capturedAtLabel(value: string) {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value || "—" : date.toISOString().slice(0, 16).replace("T", " ")
+}
+
 export function JobflowApp() {
   const [view, setView] = useState<View>("leads")
   const [leads, setLeads] = useState<Lead[]>(demoLeads)
@@ -131,8 +141,10 @@ export function JobflowApp() {
   const [queueRunId, setQueueRunId] = useState("")
   const [queueIndex, setQueueIndex] = useState(0)
   const [activeTemplateId, setActiveTemplateId] = useState(defaultTemplates[0].id)
+  const [attachments, setAttachments] = useState<File[]>([])
   const [sending, setSending] = useState(false)
   const [hydrated, setHydrated] = useState(false)
+  const attachmentInputRef = useRef<HTMLInputElement>(null)
 
   const refreshGmailStatus = useCallback(async () => {
     try {
@@ -195,6 +207,28 @@ export function JobflowApp() {
   const queueLeads = queueIds.map((id) => leads.find((lead) => lead.id === id)).filter(Boolean) as Lead[]
   const currentQueueLead = queueLeads[queueIndex]
 
+  function clearAttachments() {
+    setAttachments([])
+    if (attachmentInputRef.current) attachmentInputRef.current.value = ""
+  }
+
+  function selectAttachments(event: React.ChangeEvent<HTMLInputElement>) {
+    const next = Array.from(event.currentTarget.files || [])
+    const error = validateMessageAttachments(next)
+    if (error) {
+      event.currentTarget.value = ""
+      setAttachments([])
+      toast.error(error)
+      return
+    }
+    setAttachments(next)
+  }
+
+  function removeAttachment(index: number) {
+    setAttachments((current) => current.filter((_, itemIndex) => itemIndex !== index))
+    if (attachmentInputRef.current) attachmentInputRef.current.value = ""
+  }
+
   function startQueue() {
     const sendable = selected.filter((id) => {
       const lead = leads.find((item) => item.id === id)
@@ -205,6 +239,7 @@ export function JobflowApp() {
       return
     }
     setQueueIds(sendable)
+    clearAttachments()
     setQueueRunId(crypto.randomUUID())
     setQueueIndex(0)
     const first = leads.find((lead) => lead.id === sendable[0])
@@ -224,6 +259,7 @@ export function JobflowApp() {
     if (queueIndex >= queueLeads.length - 1) {
       setQueueOpen(false)
       setSelected([])
+      clearAttachments()
       toast.success(markSent ? "Send queue complete." : "Queue closed.")
       return
     }
@@ -249,19 +285,37 @@ export function JobflowApp() {
     window.open(`https://wa.me/${phone}?text=${encodeURIComponent(body)}`, "_blank", "noopener,noreferrer")
   }
 
+  async function shareWhatsAppAttachments() {
+    if (!attachments.length) return
+    const shareData: ShareData = { files: attachments, title: `Application files for ${contactLabel(currentQueueLead!)}` }
+    if (!navigator.share || !navigator.canShare?.(shareData)) {
+      toast.error("This browser cannot hand these files to WhatsApp. Use WhatsApp’s paperclip button to attach them manually.")
+      return
+    }
+    try {
+      await navigator.share(shareData)
+      toast.success("Files shared. Choose the correct WhatsApp conversation, then confirm only after sending.")
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return
+      toast.error("The files could not be shared. Attach them from WhatsApp instead.")
+    }
+  }
+
   async function sendCurrentEmail() {
     if (!currentQueueLead || currentQueueLead.type !== "Email" || !gmail.connected) return
     setSending(true)
     try {
-      const response = await fetch("/api/integrations/gmail/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: currentQueueLead.value, subject, body, idempotencyKey: `${queueRunId}:${currentQueueLead.id}` }),
-      })
+      const form = new FormData()
+      form.set("to", currentQueueLead.value)
+      form.set("subject", subject)
+      form.set("body", body)
+      form.set("idempotencyKey", `${queueRunId}:${currentQueueLead.id}`)
+      attachments.forEach((file) => form.append("attachments", file, file.name))
+      const response = await fetch("/api/integrations/gmail/send", { method: "POST", body: form })
       const result = await response.json() as { error?: string; providerMessageId?: string }
       if (!response.ok || !result.providerMessageId) throw new Error(result.error || "Gmail did not accept the message")
-      toast.success(`Email sent from ${gmail.email}.`, { description: `Gmail message ID: ${result.providerMessageId}` })
-      advanceQueue(true, { senderIdentity: gmail.email, providerMessageId: result.providerMessageId, sendMode: "gmail_api" })
+      toast.success(`Email sent from ${gmail.email}.`, { description: `${attachments.length ? `${attachments.length} attachment${attachments.length === 1 ? "" : "s"} · ` : ""}Gmail message ID: ${result.providerMessageId}` })
+      advanceQueue(true, { senderIdentity: gmail.email, providerMessageId: result.providerMessageId, sendMode: "gmail_api", attachmentNames: attachments.map((file) => file.name) })
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Email sending failed")
       await refreshGmailStatus()
@@ -271,7 +325,7 @@ export function JobflowApp() {
   }
 
   return (
-    <SidebarProvider>
+    <SidebarProvider className="overflow-x-clip">
       <Sidebar collapsible="icon">
         <SidebarHeader className="p-4 group-data-[collapsible=icon]:p-2">
           <button className="flex items-center gap-3 text-left" onClick={() => setView("leads")}>
@@ -339,7 +393,7 @@ export function JobflowApp() {
         <SidebarRail />
       </Sidebar>
 
-      <SidebarInset>
+      <SidebarInset className="max-w-full overflow-x-clip">
         <header className="sticky top-0 z-10 flex h-14 items-center gap-3 border-b bg-background/90 px-4 backdrop-blur md:px-6">
           <SidebarTrigger />
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -392,9 +446,10 @@ export function JobflowApp() {
         if (!open && currentQueueLead) {
           setLeads((current) => current.map((lead) => queueIds.slice(queueIndex).includes(lead.id) && (lead.status === "queued" || lead.status === "opened") ? { ...lead, status: "ready" } : lead))
         }
+        if (!open) clearAttachments()
         setQueueOpen(open)
       }}>
-        <DialogContent className="sm:max-w-xl">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
           <DialogHeader>
             <DialogTitle>Send one-by-one</DialogTitle>
             <DialogDescription>Review every personalized message before opening it in your connected app.</DialogDescription>
@@ -431,7 +486,9 @@ export function JobflowApp() {
                 <Alert>
                   <CircleHelpIcon />
                   <AlertTitle>Manual confirmation required</AlertTitle>
-                  <AlertDescription>Leadloom records “opened” when WhatsApp launches. Only choose “I sent it” after pressing Send in WhatsApp.</AlertDescription>
+                  <AlertDescription>
+                    Leadloom can prefill the message, but WhatsApp does not let a web link pre-attach local files. Open WhatsApp, then use Share attachments or WhatsApp’s paperclip button. Only confirm after pressing Send.
+                  </AlertDescription>
                 </Alert>
               )}
               <FieldGroup>
@@ -458,6 +515,32 @@ export function JobflowApp() {
                   <FieldLabel>Message preview</FieldLabel>
                   <Textarea value={body} readOnly className="min-h-44 resize-none" />
                 </Field>
+                <Field>
+                  <FieldLabel htmlFor="message-attachments">Attachments</FieldLabel>
+                  <Input
+                    ref={attachmentInputRef}
+                    id="message-attachments"
+                    type="file"
+                    accept={MESSAGE_ATTACHMENT_ACCEPT}
+                    multiple
+                    onChange={selectAttachments}
+                  />
+                  <FieldDescription>Optional. Add up to 3 PDF, DOC, DOCX, or TXT files; 2 MB each and 3 MB total. They stay selected for this send queue.</FieldDescription>
+                  {attachments.length > 0 && (
+                    <div className="grid gap-2" aria-label="Selected attachments">
+                      {attachments.map((file, index) => (
+                        <div key={`${file.name}-${file.lastModified}-${index}`} className="flex min-w-0 items-center gap-2 rounded-lg border bg-background px-3 py-2 text-sm">
+                          <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
+                          <span className="min-w-0 flex-1 truncate">{file.name}</span>
+                          <span className="shrink-0 text-xs text-muted-foreground">{formatAttachmentSize(file.size)}</span>
+                          <Button type="button" variant="ghost" size="icon-sm" aria-label={`Remove ${file.name}`} onClick={() => removeAttachment(index)}>
+                            <XIcon />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </Field>
               </FieldGroup>
             </div>
           )}
@@ -482,11 +565,17 @@ export function JobflowApp() {
               )
             ) : (
               <>
+                {attachments.length > 0 && (
+                  <Button variant="outline" disabled={currentQueueLead.status !== "opened"} onClick={() => void shareWhatsAppAttachments()}>
+                    <PaperclipIcon data-icon="inline-start" />
+                    Share attachments
+                  </Button>
+                )}
                 <Button variant="outline" disabled={!isValidWhatsAppSender(whatsappProfile.phone)} onClick={openWhatsAppDraft}>
                   <ExternalLinkIcon data-icon="inline-start" />
                   Open WhatsApp
                 </Button>
-                <Button disabled={currentQueueLead?.status !== "opened"} onClick={() => advanceQueue(true, { senderIdentity: `${whatsappProfile.name} <${whatsappProfile.phone}>`, sendMode: "whatsapp_personal" })}>
+                <Button disabled={currentQueueLead?.status !== "opened"} onClick={() => advanceQueue(true, { senderIdentity: `${whatsappProfile.name} <${whatsappProfile.phone}>`, sendMode: "whatsapp_personal", attachmentNames: attachments.map((file) => file.name) })}>
                   I sent it & next
                   <ArrowRightIcon data-icon="inline-end" />
                 </Button>
@@ -511,7 +600,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
   const [channel, setChannel] = useState<ChannelFilter>("All")
   const sendable = leads.filter((lead) => isValidContact(lead.type, lead.value))
   const visible = useMemo(() => leads.filter((lead) => {
-    const matchesQuery = `${lead.value} ${lead.label} ${lead.context} ${lead.type}`.toLowerCase().includes(query.toLowerCase())
+    const matchesQuery = `${lead.value} ${lead.label} ${lead.context} ${lead.type} ${lead.sourceType} ${lead.confidence} ${lead.section} ${lead.pageTitle}`.toLowerCase().includes(query.toLowerCase())
     const matchesChannel = channel === "All" || lead.type === channel || (channel === "Research" && !["Email", "WhatsApp"].includes(lead.type))
     return matchesQuery && matchesChannel
   }), [channel, leads, query])
@@ -524,7 +613,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
   }
 
   return (
-    <div className="flex flex-1 flex-col gap-6 p-4 md:p-6 lg:p-8">
+    <div className="flex min-w-0 flex-1 flex-col gap-6 p-4 md:p-6 lg:p-8">
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div className="flex flex-col gap-1">
           <Badge variant="outline" className="mb-1">Personal outreach workspace</Badge>
@@ -550,7 +639,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
         <MetricCard label="Needs review" value={leads.filter((lead) => lead.status === "invalid").length} helper="Invalid or incomplete contact" icon={CircleHelpIcon} />
       </div>
 
-      <Card>
+      <Card className="min-w-0">
         <CardHeader>
           <CardTitle>Lead inbox</CardTitle>
           <CardDescription>{visible.length} records shown · {selected.length} selected</CardDescription>
@@ -567,7 +656,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
             </DropdownMenu>
           </CardAction>
         </CardHeader>
-        <CardContent className="flex flex-col gap-4 px-0">
+        <CardContent className="flex min-w-0 flex-col gap-4 px-0">
           <div className="flex flex-col gap-2 px-4 sm:flex-row">
             <div className="relative flex-1">
               <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
@@ -582,14 +671,18 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
               </SelectContent>
             </Select>
           </div>
-          <ScrollArea className="h-[min(55vh,36rem)] border-y">
-            <Table>
+          <ScrollArea className="h-[min(55vh,36rem)] min-w-0 max-w-full border-y">
+            <Table className="min-w-[1280px]">
               <TableHeader className="sticky top-0 z-10 bg-card">
                 <TableRow>
                   <TableHead className="w-10"><Checkbox aria-label="Select all valid visible leads" checked={allVisibleSelected} onCheckedChange={toggleAll} /></TableHead>
                   <TableHead>Lead</TableHead>
-                  <TableHead>Channel</TableHead>
+                  <TableHead>Captured type</TableHead>
+                  <TableHead>Confidence</TableHead>
+                  <TableHead>Section</TableHead>
                   <TableHead>Source context</TableHead>
+                  <TableHead>Page</TableHead>
+                  <TableHead>Captured</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Action</TableHead>
                 </TableRow>
@@ -597,6 +690,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
               <TableBody>
                 {visible.map((lead) => {
                   const canSend = isValidContact(lead.type, lead.value)
+                  const actionUrl = safeSourceUrl(lead.link)
                   return (
                     <TableRow key={lead.id} data-state={selected.includes(lead.id) ? "selected" : undefined}>
                       <TableCell><Checkbox aria-label={`Select ${contactLabel(lead)}`} disabled={!canSend} checked={selected.includes(lead.id)} onCheckedChange={(checked) => setSelected((current) => checked ? [...current, lead.id] : current.filter((id) => id !== lead.id))} /></TableCell>
@@ -609,15 +703,25 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell><Badge variant={lead.type === "Email" || lead.type === "WhatsApp" ? "secondary" : "outline"}>{lead.type}</Badge></TableCell>
+                      <TableCell>
+                        <div className="flex flex-col items-start gap-1">
+                          <Badge variant={lead.type === "Email" || lead.type === "WhatsApp" ? "secondary" : "outline"}>{lead.sourceType || lead.type}</Badge>
+                          {lead.sourceType && lead.sourceType !== lead.type && <span className="text-xs text-muted-foreground">Routes as {lead.type}</span>}
+                        </div>
+                      </TableCell>
+                      <TableCell><Badge variant={lead.confidence?.toLowerCase() === "verified" ? "secondary" : "outline"} className="capitalize">{lead.confidence || "—"}</Badge></TableCell>
+                      <TableCell><p className="max-w-36 truncate" title={lead.section}>{lead.section || "—"}</p></TableCell>
                       <TableCell><p className="max-w-72 truncate text-muted-foreground" title={lead.context}>{lead.context || lead.pageTitle || "No context captured"}</p></TableCell>
+                      <TableCell><p className="max-w-48 truncate" title={lead.pageTitle}>{lead.pageTitle || "—"}</p></TableCell>
+                      <TableCell><span className="text-xs text-muted-foreground">{capturedAtLabel(lead.capturedAt)}</span></TableCell>
                       <TableCell><Badge variant={statusVariant(lead.status)} className="capitalize">{lead.status}</Badge></TableCell>
                       <TableCell className="text-right">
-                        {(lead.link || lead.pageUrl) ? (
-                          <Button nativeButton={false} variant="ghost" size="icon-sm" render={<a href={lead.link || lead.pageUrl} target="_blank" rel="noreferrer" />}>
-                            <ExternalLinkIcon /><span className="sr-only">Open source</span>
+                        {actionUrl ? (
+                          <Button nativeButton={false} variant="ghost" size="sm" render={<a href={actionUrl} target="_blank" rel="noopener noreferrer" title="Open imported link" />}>
+                            Open
+                            <ExternalLinkIcon data-icon="inline-end" />
                           </Button>
-                        ) : <span className="text-xs text-muted-foreground">—</span>}
+                        ) : null}
                       </TableCell>
                     </TableRow>
                   )
@@ -627,7 +731,7 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
           </ScrollArea>
         </CardContent>
         <CardFooter className="justify-between gap-3">
-          <p className="text-xs text-muted-foreground">Only validated contacts can be added to a send queue.</p>
+          <p className="text-xs text-muted-foreground">The Open action appears only when the imported Link column contains a valid URL.</p>
           <Button size="sm" disabled={!selected.length} onClick={onSend}>Review {selected.length || ""} selected <ArrowRightIcon data-icon="inline-end" /></Button>
         </CardFooter>
       </Card>
@@ -684,7 +788,7 @@ function ImportDialog({ open, onOpenChange, onImport }: { open: boolean; onOpenC
             <button type="button" className="flex min-h-36 w-full flex-col items-center justify-center gap-2 rounded-xl border border-dashed bg-muted/30 p-6 text-center hover:bg-muted/60" onClick={() => inputRef.current?.click()}>
               <span className="flex size-10 items-center justify-center rounded-lg bg-background ring-1 ring-foreground/10"><FileSpreadsheetIcon className="size-5" /></span>
               <span className="font-medium">{file ? file.name : "Choose a CSV, XLS, or XLSX file"}</span>
-              <span className="text-xs text-muted-foreground">Expected columns: Type, Value, Label, Link, Section, Context, Page title, Page URL, Captured at</span>
+              <span className="text-xs text-muted-foreground">Expected columns: Type, Value, Label, Link, Section, Context, Confidence, Page title, Page URL, Post URL (optional), Captured at</span>
             </button>
             <Input ref={inputRef} id="lead-file" type="file" accept={leadImportAccept} className="sr-only" onChange={(event) => {
               setFile(event.target.files?.[0] ?? null)
@@ -768,7 +872,7 @@ function HistoryView({ leads, sentCount, replyCount }: { leads: Lead[]; sentCoun
       <div className="flex flex-col gap-1"><h1 className="font-heading text-2xl font-semibold">Send history</h1><p className="text-sm text-muted-foreground">A lightweight record of drafts you marked as sent.</p></div>
       <div className="grid gap-3 sm:grid-cols-3"><MetricCard label="Sent" value={sentCount} helper="Email and WhatsApp" icon={SendIcon} /><MetricCard label="Replies" value={replyCount} helper="Marked manually" icon={MessageCircleIcon} /><MetricCard label="Reply rate" value={sentCount ? Math.round((replyCount / sentCount) * 100) : 0} helper="Percentage of sent leads" icon={LayoutDashboardIcon} /></div>
       <Card><CardHeader><CardTitle>Recent outreach</CardTitle><CardDescription>{sent.length ? `${sent.length} completed contacts` : "Nothing sent yet"}</CardDescription></CardHeader><CardContent>
-        {sent.length ? <div className="flex flex-col gap-2">{sent.map((lead) => <div key={lead.id} className="flex items-center gap-3 rounded-lg border p-3"><Avatar className="size-8"><AvatarFallback>{initials(contactLabel(lead))}</AvatarFallback></Avatar><div className="min-w-0 flex-1"><p className="truncate font-medium">{contactLabel(lead)}</p><p className="truncate text-xs text-muted-foreground">{lead.value}</p></div><Badge variant={statusVariant(lead.status)}>{lead.status}</Badge></div>)}</div> : <Alert><SparklesIcon /><AlertTitle>Your history is ready</AlertTitle><AlertDescription>Select validated contacts in the lead inbox and complete the one-by-one send queue.</AlertDescription></Alert>}
+        {sent.length ? <div className="flex flex-col gap-2">{sent.map((lead) => <div key={lead.id} className="flex items-center gap-3 rounded-lg border p-3"><Avatar className="size-8"><AvatarFallback>{initials(contactLabel(lead))}</AvatarFallback></Avatar><div className="min-w-0 flex-1"><p className="truncate font-medium">{contactLabel(lead)}</p><p className="truncate text-xs text-muted-foreground">{lead.value}</p>{lead.attachmentNames?.length ? <p className="truncate text-xs text-muted-foreground"><PaperclipIcon className="mr-1 inline size-3" />{lead.attachmentNames.join(", ")}</p> : null}</div><Badge variant={statusVariant(lead.status)}>{lead.status}</Badge></div>)}</div> : <Alert><SparklesIcon /><AlertTitle>Your history is ready</AlertTitle><AlertDescription>Select validated contacts in the lead inbox and complete the one-by-one send queue.</AlertDescription></Alert>}
       </CardContent></Card>
     </div>
   )

@@ -149,7 +149,26 @@ function safeHeader(value: string) {
   return value.replace(/[\r\n]+/g, " ").trim()
 }
 
-export async function sendGmailMessage(session: GmailSession, input: { to: string; subject: string; body: string }) {
+function wrapBase64(value: Buffer | string) {
+  const encoded = Buffer.isBuffer(value) ? value.toString("base64") : Buffer.from(value, "utf8").toString("base64")
+  return encoded.match(/.{1,76}/g)?.join("\r\n") || ""
+}
+
+function mimeFileName(value: string) {
+  const clean = safeHeader(value)
+  return {
+    fallback: clean.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_") || "attachment",
+    encoded: encodeURIComponent(clean).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`),
+  }
+}
+
+export type GmailAttachment = {
+  name: string
+  contentType: string
+  content: Buffer
+}
+
+export async function sendGmailMessage(session: GmailSession, input: { to: string; subject: string; body: string; attachments?: GmailAttachment[] }) {
   const to = safeHeader(input.to)
   const subject = safeHeader(input.subject)
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw new Error("The recipient email address is invalid")
@@ -157,17 +176,51 @@ export async function sendGmailMessage(session: GmailSession, input: { to: strin
   if (!input.body.trim() || input.body.length > 100_000) throw new Error("The email body is empty or too large")
 
   const encodedSubject = `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`
-  const mime = [
+  const headers = [
     `To: ${to}`,
     `From: ${safeHeader(session.name)} <${safeHeader(session.email)}>`,
     `Reply-To: ${safeHeader(session.email)}`,
     `Subject: ${encodedSubject}`,
     "MIME-Version: 1.0",
-    'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: 8bit",
-    "",
-    input.body,
-  ].join("\r\n")
+  ]
+  const attachments = input.attachments || []
+  let mime: string
+
+  if (attachments.length === 0) {
+    mime = [
+      ...headers,
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      wrapBase64(input.body),
+    ].join("\r\n")
+  } else {
+    const boundary = `leadloom_${randomBytes(18).toString("hex")}`
+    const parts = attachments.flatMap((attachment) => {
+      const fileName = mimeFileName(attachment.name)
+      return [
+        `--${boundary}`,
+        `Content-Type: ${attachment.contentType}; name="${fileName.fallback}"; name*=UTF-8''${fileName.encoded}`,
+        `Content-Disposition: attachment; filename="${fileName.fallback}"; filename*=UTF-8''${fileName.encoded}`,
+        "Content-Transfer-Encoding: base64",
+        "",
+        wrapBase64(attachment.content),
+      ]
+    })
+    mime = [
+      ...headers,
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      "",
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      wrapBase64(input.body),
+      ...parts,
+      `--${boundary}--`,
+      "",
+    ].join("\r\n")
+  }
 
   const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
     method: "POST",

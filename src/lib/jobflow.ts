@@ -5,6 +5,7 @@ export type LeadStatus = "new" | "ready" | "queued" | "opened" | "sent" | "repli
 export type Lead = {
   id: string
   type: LeadChannel
+  sourceType?: string
   value: string
   label: string
   link: string
@@ -12,12 +13,15 @@ export type Lead = {
   context: string
   pageTitle: string
   pageUrl: string
+  postUrl?: string
   capturedAt: string
+  confidence?: string
   status: LeadStatus
   sentAt?: string
   senderIdentity?: string
   providerMessageId?: string
   sendMode?: "gmail_api" | "whatsapp_personal"
+  attachmentNames?: string[]
 }
 
 export type MessageTemplate = {
@@ -147,11 +151,11 @@ export const defaultTemplates: MessageTemplate[] = [
 
 export function normalizeChannel(value: string): LeadChannel {
   const normalized = value.trim().toLowerCase()
-  if (normalized === "email") return "Email"
+  if (normalized === "email" || normalized === "hiring email") return "Email"
   if (normalized === "whatsapp") return "WhatsApp"
   if (normalized === "linkedin profile") return "LinkedIn profile"
-  if (normalized === "company page") return "Company page"
-  if (normalized === "job link") return "Job link"
+  if (normalized === "company page" || normalized === "company website") return "Company page"
+  if (normalized === "job link" || normalized === "job board link" || normalized === "apply link") return "Job link"
   return "Other"
 }
 
@@ -161,23 +165,63 @@ export function isValidContact(type: LeadChannel, value: string) {
   return false
 }
 
+export function specificLinkedInPostUrl(value: string | undefined) {
+  if (!value) return ""
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase()
+    const isLinkedIn = host === "linkedin.com" || host.endsWith(".linkedin.com")
+    const isPost = url.pathname.startsWith("/posts/") || url.pathname.startsWith("/feed/update/")
+    return url.protocol === "https:" && isLinkedIn && isPost ? url.toString() : ""
+  } catch {
+    return ""
+  }
+}
+
+export function safeSourceUrl(...values: Array<string | undefined>) {
+  for (const value of values) {
+    if (!value) continue
+    try {
+      const url = new URL(value)
+      if (url.protocol === "https:" || url.protocol === "http:") return url.toString()
+    } catch {
+      // Continue to the next captured URL.
+    }
+  }
+  return ""
+}
+
 export function makeLead(row: Record<string, unknown>, index: number): Lead {
   const text = (key: string) => String(row[key] ?? "").trim()
-  const type = normalizeChannel(text("Type"))
+  const sourceType = text("Type")
+  const type = normalizeChannel(sourceType)
   const value = text("Value")
+  const pageUrl = text("Page URL")
+  const postUrl = specificLinkedInPostUrl(
+    text("Post URL") ||
+    text("Post link") ||
+    text("Post permalink") ||
+    text("Source post URL") ||
+    text("Source URL") ||
+    text("Permalink") ||
+    pageUrl
+  )
   const contact = type === "Email" || type === "WhatsApp"
 
   return {
     id: `import-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
     type,
+    sourceType,
     value,
     label: text("Label"),
     link: text("Link"),
     section: text("Section"),
     context: text("Context"),
     pageTitle: text("Page title"),
-    pageUrl: text("Page URL"),
+    pageUrl,
+    postUrl,
     capturedAt: text("Captured at"),
+    confidence: text("Confidence"),
     status: contact ? (isValidContact(type, value) ? "ready" : "invalid") : "new",
   }
 }

@@ -25,8 +25,11 @@ export async function parseLeadFile(file: File): Promise<Lead[]> {
   if (file.size > MAX_IMPORT_BYTES) throw new Error("The file is larger than the 10 MB import limit.")
 
   const { read, utils } = await import("xlsx")
-  const workbook = read(await file.arrayBuffer(), {
-    type: "array",
+  const data = extension === "csv"
+    ? new TextDecoder("utf-8").decode(await file.arrayBuffer())
+    : await file.arrayBuffer()
+  const workbook = read(data, {
+    type: extension === "csv" ? "string" : "array",
     cellDates: false,
     dense: true,
   })
