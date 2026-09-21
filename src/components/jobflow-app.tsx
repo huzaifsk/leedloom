@@ -672,19 +672,16 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
             </Select>
           </div>
           <ScrollArea className="h-[min(55vh,36rem)] min-w-0 max-w-full border-y">
-            <Table className="min-w-[1280px]">
+            <Table className="table-fixed">
               <TableHeader className="sticky top-0 z-10 bg-card">
                 <TableRow>
                   <TableHead className="w-10"><Checkbox aria-label="Select all valid visible leads" checked={allVisibleSelected} onCheckedChange={toggleAll} /></TableHead>
-                  <TableHead>Lead</TableHead>
-                  <TableHead>Captured type</TableHead>
-                  <TableHead>Confidence</TableHead>
-                  <TableHead>Section</TableHead>
-                  <TableHead>Source context</TableHead>
-                  <TableHead>Page</TableHead>
-                  <TableHead>Captured</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Action</TableHead>
+                  <TableHead className="w-[46%] md:w-[34%] lg:w-[24%]">Lead</TableHead>
+                  <TableHead className="hidden w-40 md:table-cell">Type</TableHead>
+                  <TableHead className="hidden lg:table-cell">Source details</TableHead>
+                  <TableHead className="hidden w-36 xl:table-cell">Captured</TableHead>
+                  <TableHead className="w-20">Status</TableHead>
+                  <TableHead className="w-20 text-right">Action</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -693,27 +690,29 @@ function LeadsView({ leads, setLeads, selected, setSelected, onImport, onSend }:
                   const actionUrl = safeSourceUrl(lead.link)
                   return (
                     <TableRow key={lead.id} data-state={selected.includes(lead.id) ? "selected" : undefined}>
-                      <TableCell><Checkbox aria-label={`Select ${contactLabel(lead)}`} disabled={!canSend} checked={selected.includes(lead.id)} onCheckedChange={(checked) => setSelected((current) => checked ? [...current, lead.id] : current.filter((id) => id !== lead.id))} /></TableCell>
+                      <TableCell className="w-10"><Checkbox aria-label={`Select ${contactLabel(lead)}`} disabled={!canSend} checked={selected.includes(lead.id)} onCheckedChange={(checked) => setSelected((current) => checked ? [...current, lead.id] : current.filter((id) => id !== lead.id))} /></TableCell>
                       <TableCell>
-                        <div className="flex items-center gap-3">
-                          <Avatar className="size-8"><AvatarFallback>{initials(contactLabel(lead))}</AvatarFallback></Avatar>
-                          <div className="max-w-52">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Avatar className="hidden size-8 shrink-0 sm:flex"><AvatarFallback>{initials(contactLabel(lead))}</AvatarFallback></Avatar>
+                          <div className="min-w-0">
                             <p className="truncate font-medium capitalize">{contactLabel(lead)}</p>
                             <p className="truncate text-xs text-muted-foreground">{lead.value}</p>
                           </div>
                         </div>
                       </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col items-start gap-1">
+                      <TableCell className="hidden md:table-cell">
+                        <div className="flex min-w-0 flex-col items-start gap-1">
                           <Badge variant={lead.type === "Email" || lead.type === "WhatsApp" ? "secondary" : "outline"}>{lead.sourceType || lead.type}</Badge>
-                          {lead.sourceType && lead.sourceType !== lead.type && <span className="text-xs text-muted-foreground">Routes as {lead.type}</span>}
+                          <span className="truncate text-xs capitalize text-muted-foreground">{lead.confidence || "No confidence"}</span>
                         </div>
                       </TableCell>
-                      <TableCell><Badge variant={lead.confidence?.toLowerCase() === "verified" ? "secondary" : "outline"} className="capitalize">{lead.confidence || "—"}</Badge></TableCell>
-                      <TableCell><p className="max-w-36 truncate" title={lead.section}>{lead.section || "—"}</p></TableCell>
-                      <TableCell><p className="max-w-72 truncate text-muted-foreground" title={lead.context}>{lead.context || lead.pageTitle || "No context captured"}</p></TableCell>
-                      <TableCell><p className="max-w-48 truncate" title={lead.pageTitle}>{lead.pageTitle || "—"}</p></TableCell>
-                      <TableCell><span className="text-xs text-muted-foreground">{capturedAtLabel(lead.capturedAt)}</span></TableCell>
+                      <TableCell className="hidden lg:table-cell">
+                        <div className="min-w-0">
+                          <p className="truncate text-muted-foreground" title={lead.context}>{lead.context || "No context captured"}</p>
+                          <p className="truncate text-xs text-muted-foreground" title={[lead.section, lead.pageTitle].filter(Boolean).join(" · ")}>{[lead.section, lead.pageTitle].filter(Boolean).join(" · ") || "No page details"}</p>
+                        </div>
+                      </TableCell>
+                      <TableCell className="hidden xl:table-cell"><span className="text-xs text-muted-foreground">{capturedAtLabel(lead.capturedAt)}</span></TableCell>
                       <TableCell><Badge variant={statusVariant(lead.status)} className="capitalize">{lead.status}</Badge></TableCell>
                       <TableCell className="text-right">
                         {actionUrl ? (
