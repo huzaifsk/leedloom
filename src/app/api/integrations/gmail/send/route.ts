@@ -59,7 +59,7 @@ export async function POST(request: Request) {
     const { session, refreshed } = await refreshGmailSession(current)
     const lastSentAt = lastSendByAccount.get(session.email) || 0
     if (Date.now() - lastSentAt < 750) {
-      return NextResponse.json({ error: "Please wait briefly before sending the next email." }, { status: 429 })
+      return NextResponse.json({ error: "Please wait briefly before sending the next email." }, { status: 429, headers: { "Retry-After": "1" } })
     }
     const result = await sendGmailMessage(session, {
       to: String(input.to || ""),

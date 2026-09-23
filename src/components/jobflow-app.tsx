@@ -143,6 +143,7 @@ export function JobflowApp() {
   const [activeTemplateId, setActiveTemplateId] = useState(defaultTemplates[0].id)
   const [attachments, setAttachments] = useState<File[]>([])
   const [sending, setSending] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState<{ completed: number; total: number } | null>(null)
   const [hydrated, setHydrated] = useState(false)
   const attachmentInputRef = useRef<HTMLInputElement>(null)
 
@@ -273,6 +274,9 @@ export function JobflowApp() {
   const resolvedSenderName = currentQueueLead?.type === "Email" ? gmail.name || senderName : whatsappProfile.name || senderName
   const subject = currentQueueLead && activeTemplate ? renderTemplate(activeTemplate.subject, currentQueueLead, resolvedSenderName) : ""
   const body = currentQueueLead && activeTemplate ? renderTemplate(activeTemplate.body, currentQueueLead, resolvedSenderName) : ""
+  const remainingQueueLeads = queueLeads.slice(queueIndex)
+  const remainingEmailLeads = remainingQueueLeads.filter((lead) => lead.type === "Email")
+  const canSendAllRemainingEmails = remainingQueueLeads.length > 1 && remainingEmailLeads.length === remainingQueueLeads.length
 
   function openWhatsAppDraft() {
     if (!currentQueueLead || !activeTemplate) return
@@ -301,26 +305,85 @@ export function JobflowApp() {
     }
   }
 
+  async function deliverEmail(lead: Lead) {
+    if (!gmail.connected || activeTemplate.channel !== "Email") throw new Error("Choose an email template and connect Gmail before sending.")
+    const personalizedSubject = renderTemplate(activeTemplate.subject, lead, gmail.name || senderName)
+    const personalizedBody = renderTemplate(activeTemplate.body, lead, gmail.name || senderName)
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const form = new FormData()
+      form.set("to", lead.value)
+      form.set("subject", personalizedSubject)
+      form.set("body", personalizedBody)
+      form.set("idempotencyKey", `${queueRunId}:${lead.id}`)
+      attachments.forEach((file) => form.append("attachments", file, file.name))
+      const response = await fetch("/api/integrations/gmail/send", { method: "POST", body: form })
+      const result = await response.json() as { error?: string; providerMessageId?: string }
+      if (response.status === 429 && attempt === 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000))
+        continue
+      }
+      if (!response.ok || !result.providerMessageId) throw new Error(result.error || "Gmail did not accept the message")
+      return result.providerMessageId
+    }
+    throw new Error("Gmail is temporarily rate limiting this send.")
+  }
+
   async function sendCurrentEmail() {
     if (!currentQueueLead || currentQueueLead.type !== "Email" || !gmail.connected) return
     setSending(true)
     try {
-      const form = new FormData()
-      form.set("to", currentQueueLead.value)
-      form.set("subject", subject)
-      form.set("body", body)
-      form.set("idempotencyKey", `${queueRunId}:${currentQueueLead.id}`)
-      attachments.forEach((file) => form.append("attachments", file, file.name))
-      const response = await fetch("/api/integrations/gmail/send", { method: "POST", body: form })
-      const result = await response.json() as { error?: string; providerMessageId?: string }
-      if (!response.ok || !result.providerMessageId) throw new Error(result.error || "Gmail did not accept the message")
-      toast.success(`Email sent from ${gmail.email}.`, { description: `${attachments.length ? `${attachments.length} attachment${attachments.length === 1 ? "" : "s"} · ` : ""}Gmail message ID: ${result.providerMessageId}` })
-      advanceQueue(true, { senderIdentity: gmail.email, providerMessageId: result.providerMessageId, sendMode: "gmail_api", attachmentNames: attachments.map((file) => file.name) })
+      const providerMessageId = await deliverEmail(currentQueueLead)
+      toast.success(`Email sent from ${gmail.email}.`, { description: `${attachments.length ? `${attachments.length} attachment${attachments.length === 1 ? "" : "s"} · ` : ""}Gmail message ID: ${providerMessageId}` })
+      advanceQueue(true, { senderIdentity: gmail.email, providerMessageId, sendMode: "gmail_api", attachmentNames: attachments.map((file) => file.name) })
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Email sending failed")
       await refreshGmailStatus()
     } finally {
       setSending(false)
+    }
+  }
+
+  async function sendAllRemainingEmails() {
+    if (!gmail.connected || !canSendAllRemainingEmails) return
+    const recipients = [...remainingEmailLeads]
+    const attachmentNames = attachments.map((file) => file.name)
+    let completed = 0
+    setSending(true)
+    setBulkProgress({ completed: 0, total: recipients.length })
+
+    try {
+      for (const lead of recipients) {
+        const providerMessageId = await deliverEmail(lead)
+        completed += 1
+        setBulkProgress({ completed, total: recipients.length })
+        setLeads((current) => current.map((item) => item.id === lead.id ? {
+          ...item,
+          status: "sent",
+          sentAt: new Date().toISOString(),
+          senderIdentity: gmail.email,
+          providerMessageId,
+          sendMode: "gmail_api",
+          attachmentNames,
+        } : item))
+        if (completed < recipients.length) await new Promise((resolve) => window.setTimeout(resolve, 850))
+      }
+
+      setQueueOpen(false)
+      setSelected([])
+      clearAttachments()
+      toast.success(`${completed} emails sent individually from ${gmail.email}.`)
+    } catch (error) {
+      const failedLead = recipients[completed]
+      const failedIndex = failedLead ? queueLeads.findIndex((lead) => lead.id === failedLead.id) : queueIndex
+      if (failedIndex >= 0) setQueueIndex(failedIndex)
+      toast.error(`Bulk send stopped after ${completed} of ${recipients.length} emails.`, {
+        description: error instanceof Error ? error.message : "Gmail sending failed",
+      })
+      await refreshGmailStatus()
+    } finally {
+      setSending(false)
+      setBulkProgress(null)
     }
   }
 
@@ -443,6 +506,7 @@ export function JobflowApp() {
       />
 
       <Dialog open={queueOpen} onOpenChange={(open) => {
+        if (!open && sending) return
         if (!open && currentQueueLead) {
           setLeads((current) => current.map((lead) => queueIds.slice(queueIndex).includes(lead.id) && (lead.status === "queued" || lead.status === "opened") ? { ...lead, status: "ready" } : lead))
         }
@@ -451,13 +515,17 @@ export function JobflowApp() {
       }}>
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
           <DialogHeader>
-            <DialogTitle>Send one-by-one</DialogTitle>
-            <DialogDescription>Review every personalized message before opening it in your connected app.</DialogDescription>
+            <DialogTitle>{currentQueueLead?.type === "Email" ? "Prepare email delivery" : "Send one-by-one"}</DialogTitle>
+            <DialogDescription>
+              {currentQueueLead?.type === "Email"
+                ? "Choose the template and attachments once. Leadloom personalizes and sends a separate Gmail message to each selected email recipient."
+                : "Review every personalized message before opening it in your connected app."}
+            </DialogDescription>
           </DialogHeader>
           {currentQueueLead && activeTemplate && (
             <div className="flex flex-col gap-4">
-              <Progress value={queueIndex + 1} max={queueLeads.length}>
-                <ProgressLabel>Recipient {queueIndex + 1} of {queueLeads.length}</ProgressLabel>
+              <Progress value={bulkProgress?.completed ?? queueIndex + 1} max={bulkProgress?.total ?? queueLeads.length}>
+                <ProgressLabel>{bulkProgress ? `Sending email ${Math.min(bulkProgress.completed + 1, bulkProgress.total)} of ${bulkProgress.total}` : `Recipient ${queueIndex + 1} of ${queueLeads.length}`}</ProgressLabel>
                 <ProgressValue />
               </Progress>
               <div className="flex items-center gap-3 rounded-lg border p-3">
@@ -491,10 +559,21 @@ export function JobflowApp() {
                   </AlertDescription>
                 </Alert>
               )}
+              {currentQueueLead.type === "Email" && remainingEmailLeads.length > 1 && (
+                <Alert>
+                  <MailIcon />
+                  <AlertTitle>{canSendAllRemainingEmails ? `${remainingEmailLeads.length} separate emails` : "Select email recipients only for bulk send"}</AlertTitle>
+                  <AlertDescription>
+                    {canSendAllRemainingEmails
+                      ? "“Send all” uses this template and these attachments for every email recipient. Personalization fields are rendered separately, and sending stops immediately if any delivery fails."
+                      : "This queue also contains WhatsApp recipients. Close it, filter the inbox to Email, select the recipients, and reopen the review queue to enable Send all."}
+                  </AlertDescription>
+                </Alert>
+              )}
               <FieldGroup>
                 <Field>
                   <FieldLabel>Template</FieldLabel>
-                  <Select value={activeTemplateId} onValueChange={(value) => value && setActiveTemplateId(String(value))}>
+                  <Select disabled={sending} value={activeTemplateId} onValueChange={(value) => value && setActiveTemplateId(String(value))}>
                     <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectGroup>
@@ -523,6 +602,7 @@ export function JobflowApp() {
                     type="file"
                     accept={MESSAGE_ATTACHMENT_ACCEPT}
                     multiple
+                    disabled={sending}
                     onChange={selectAttachments}
                   />
                   <FieldDescription>Optional. Add up to 3 PDF, DOC, DOCX, or TXT files; 2 MB each and 3 MB total. They stay selected for this send queue.</FieldDescription>
@@ -533,7 +613,7 @@ export function JobflowApp() {
                           <FileTextIcon className="size-4 shrink-0 text-muted-foreground" />
                           <span className="min-w-0 flex-1 truncate">{file.name}</span>
                           <span className="shrink-0 text-xs text-muted-foreground">{formatAttachmentSize(file.size)}</span>
-                          <Button type="button" variant="ghost" size="icon-sm" aria-label={`Remove ${file.name}`} onClick={() => removeAttachment(index)}>
+                          <Button type="button" variant="ghost" size="icon-sm" disabled={sending} aria-label={`Remove ${file.name}`} onClick={() => removeAttachment(index)}>
                             <XIcon />
                           </Button>
                         </div>
@@ -545,13 +625,21 @@ export function JobflowApp() {
             </div>
           )}
           <DialogFooter>
-            <Button variant="ghost" onClick={() => advanceQueue(false)}>Skip</Button>
+            <Button variant="ghost" disabled={sending} onClick={() => advanceQueue(false)}>Skip</Button>
             {currentQueueLead?.type === "Email" ? (
               gmail.connected ? (
-                <Button disabled={sending} onClick={sendCurrentEmail}>
-                  {sending ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <MailIcon data-icon="inline-start" />}
-                  {sending ? "Sending…" : "Send email & next"}
-                </Button>
+                <>
+                  <Button variant={canSendAllRemainingEmails ? "outline" : "default"} disabled={sending} onClick={sendCurrentEmail}>
+                    {sending && !bulkProgress ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <MailIcon data-icon="inline-start" />}
+                    {sending && !bulkProgress ? "Sending…" : canSendAllRemainingEmails ? "Send this only" : "Send email & next"}
+                  </Button>
+                  {canSendAllRemainingEmails && (
+                    <Button disabled={sending} onClick={() => void sendAllRemainingEmails()}>
+                      {bulkProgress ? <Loader2Icon data-icon="inline-start" className="animate-spin" /> : <SendIcon data-icon="inline-start" />}
+                      {bulkProgress ? `Sending ${bulkProgress.completed}/${bulkProgress.total}` : `Send all ${remainingEmailLeads.length} emails`}
+                    </Button>
+                  )}
+                </>
               ) : (
                 <Button onClick={() => {
                   setLeads((current) => current.map((lead) => queueIds.slice(queueIndex).includes(lead.id) ? { ...lead, status: "ready" } : lead))
